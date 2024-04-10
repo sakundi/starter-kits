@@ -1,14 +1,13 @@
 import torch
 import warnings
 import forta_agent
+import pandas as pd
 from forta_agent import get_json_rpc_url, EntityType
 from joblib import load
 from evmdasm import EvmBytecode
 from web3 import Web3
 from os import environ
 from transformers import (set_seed,
-                          TrainingArguments,
-                          Trainer,
                           GPT2Config,
                           GPT2Tokenizer,
                           GPT2ForSequenceClassification)
@@ -33,6 +32,7 @@ SECRETS_JSON = get_secrets()
 
 web3 = Web3(Web3.HTTPProvider(get_json_rpc_url()))
 ML_MODEL = None
+TOKENIZER = None
 
 # Supress deprecation warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -40,11 +40,6 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 
 # Set seed for reproducibility.
 set_seed(4444)
-
-epochs = 4
-batch_size = 10
-# Max lenght gpt2 => 1024
-max_length = None
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -59,24 +54,31 @@ def initialize():
     this function loads the ml model.
     """
     global ML_MODEL
-    logger.info("Start loading model")
+    global TOKENIZER
+    logger.info("Loading configuration...")
     # Get model configuration.
-    model_config = GPT2Config.from_pretrained(pretrained_model_name_or_path=model_name_or_path, num_labels=n_labels)
+    model_config = GPT2Config.from_pretrained(pretrained_model_name_or_path=model_name_or_path,
+                                              num_labels=n_labels, local_files_only=True,
+                                              use_safetensors=True)
     # Get model's tokenizer.
-    print('Loading tokenizer...')
-    tokenizer = GPT2Tokenizer.from_pretrained(pretrained_model_name_or_path=tokenizer_name_or_path)
+    logger.info('Loading tokenizer...')
+    TOKENIZER = GPT2Tokenizer.from_pretrained(pretrained_model_name_or_path=tokenizer_name_or_path,
+                                              local_files_only=True, use_safetensors=True)
     # default to left padding
-    tokenizer.padding_side = "left"
-    # Define PAD Token = EOS Token = 50256
-    tokenizer.pad_token = tokenizer.eos_token
+    TOKENIZER.padding_side = "left"
+    # Define PAD Token = EOS Token = 0
+    TOKENIZER.pad_token = TOKENIZER.eos_token
     # Get the actual model.
-    model = GPT2ForSequenceClassification.from_pretrained(pretrained_model_name_or_path=model_name_or_path, config=model_config)
+    logger.info('Loading model...')
+    ML_MODEL = GPT2ForSequenceClassification.from_pretrained(pretrained_model_name_or_path=model_name_or_path,
+                                                      config=model_config, local_files_only=True,
+                                                      use_safetensors=True)
     # resize model embedding to match new tokenizer
-    model.resize_token_embeddings(len(tokenizer))
+    ML_MODEL.resize_token_embeddings(len(TOKENIZER))
     # fix model padding token id
-    model.config.pad_token_id = model.config.eos_token_id
+    ML_MODEL.config.pad_token_id = ML_MODEL.config.eos_token_id
     # Load model to defined device.
-    model.to(device)
+    ML_MODEL.to(device)
     logger.info("Complete loading model")
 
     global CHAIN_ID
@@ -92,11 +94,44 @@ def exec_model(w3, opcodes: str, contract_creator: str) -> tuple:
     """
     score = None
     features, opcode_addresses = get_features(w3, opcodes, contract_creator)
-    score = ML_MODEL.predict_proba([features])[0][1]
-    score = round(score, 4)
+    score = evaluate(features, device)
 
     return score, opcode_addresses
 
+def evaluate(sample, device_):
+    global ML_MODEL
+    ML_MODEL.eval()
+
+    processed_batch = {}
+    processed_batch["input_ids"] = extract_sequences(sample, 128).to(device_)
+    with torch.no_grad():
+        outputs = ML_MODEL(**processed_batch)
+        logits = outputs.logits.detach().cpu().numpy()
+        predict_content = logits.argmax(axis=-1).flatten()
+        if not predict_content.all():
+            return labels_ids["malicious"]
+        else:
+            return labels_ids["normal"]
+
+def extract_sequences(data, stride):
+    global TOKENIZER
+    encodings = TOKENIZER(data, return_tensors="pt")
+    max_length = ML_MODEL.config.n_positions
+    seq_len = encodings.input_ids.size(1)
+    prev_end_loc = 0
+    sequences = []
+    for begin_loc in range(0, seq_len, stride):
+        end_loc = min(begin_loc + max_length, seq_len)
+        trg_len = end_loc - prev_end_loc
+        input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
+        list = input_ids[0].tolist()
+        list.extend([0] * (max_length - len(list)))
+        sequences.append(list)
+        prev_end_loc = end_loc
+        if end_loc == seq_len:
+            break
+    sequence_data = pd.DataFrame(sequences)
+    return torch.tensor(sequence_data.values).type(torch.long)
 
 def detect_malicious_contract_tx(
     w3, transaction_event: forta_agent.transaction_event.TransactionEvent
@@ -207,7 +242,7 @@ def detect_malicious_contract(
                     },
                 ]
 
-                if model_score >= MODEL_THRESHOLD:
+                if model_score == labels_ids["malicious"]:
                     labels.extend(
                         [
                             {
@@ -231,7 +266,7 @@ def detect_malicious_contract(
                             labels,
                         )
                     )
-                elif model_score <= SAFE_CONTRACT_THRESHOLD:
+                elif model_score == labels_ids["normal"]:
                     labels.extend(
                         [
                             {
