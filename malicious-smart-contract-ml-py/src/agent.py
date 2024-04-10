@@ -1,10 +1,17 @@
+import torch
+import warnings
 import forta_agent
 from forta_agent import get_json_rpc_url, EntityType
 from joblib import load
 from evmdasm import EvmBytecode
 from web3 import Web3
 from os import environ
-
+from transformers import (set_seed,
+                          TrainingArguments,
+                          Trainer,
+                          GPT2Config,
+                          GPT2Tokenizer,
+                          GPT2ForSequenceClassification)
 
 from src.constants import (
     BYTE_CODE_LENGTH_THRESHOLD,
@@ -27,6 +34,25 @@ SECRETS_JSON = get_secrets()
 web3 = Web3(Web3.HTTPProvider(get_json_rpc_url()))
 ML_MODEL = None
 
+# Supress deprecation warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# Set seed for reproducibility.
+set_seed(4444)
+
+epochs = 4
+batch_size = 10
+# Max lenght gpt2 => 1024
+max_length = None
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+model_name_or_path = './model'
+tokenizer_name_or_path = './tokenizer'
+
+labels_ids = {'malicious': 0, 'normal': 1}
+n_labels = len(labels_ids)
 
 def initialize():
     """
@@ -34,7 +60,23 @@ def initialize():
     """
     global ML_MODEL
     logger.info("Start loading model")
-    ML_MODEL = load("malicious_non_token_model_02_07_23_exp2.joblib")
+    # Get model configuration.
+    model_config = GPT2Config.from_pretrained(pretrained_model_name_or_path=model_name_or_path, num_labels=n_labels)
+    # Get model's tokenizer.
+    print('Loading tokenizer...')
+    tokenizer = GPT2Tokenizer.from_pretrained(pretrained_model_name_or_path=tokenizer_name_or_path)
+    # default to left padding
+    tokenizer.padding_side = "left"
+    # Define PAD Token = EOS Token = 50256
+    tokenizer.pad_token = tokenizer.eos_token
+    # Get the actual model.
+    model = GPT2ForSequenceClassification.from_pretrained(pretrained_model_name_or_path=model_name_or_path, config=model_config)
+    # resize model embedding to match new tokenizer
+    model.resize_token_embeddings(len(tokenizer))
+    # fix model padding token id
+    model.config.pad_token_id = model.config.eos_token_id
+    # Load model to defined device.
+    model.to(device)
     logger.info("Complete loading model")
 
     global CHAIN_ID
