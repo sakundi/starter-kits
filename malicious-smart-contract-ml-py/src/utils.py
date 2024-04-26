@@ -83,14 +83,14 @@ def get_features(w3, opcodes, contract_creator) -> list:
             opcode_addresses.add(Web3.toChecksumAddress(f"0x{opcode.operand}"))
 
         if opcode_name in {"PUSH4", "PUSH32"}:
-            features.append(opcode.operand)
+            features.append('')
         elif opcode_name == "PUSH20":
             if opcode.operand == contract_creator:
-                features.append("creator")
+                features.append("CREATOR")
             elif opcode.operand == MASK:
                 features.append(MASK)
             else:
-                features.append("addr")
+                features.append("ADDRESS")
 
     features = " ".join(features)
 
